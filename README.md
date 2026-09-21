@@ -27,11 +27,12 @@ app/
   main.py        FastAPI 路由与启动初始化
   mimeparser.py  严格 MIME/RFC 5322 解析、传输解码、规范化与指纹
   related.py     cid: 内嵌资源引用审计（RFC 2392，multipart/related 作用域）
+  displaybody.py 展示正文选择（alternative/related/mixed 递归规则，纯只读）
   database.py    SQLite 建表、事务化写入、消息/节点/附件查询
   errors.py      定位到节点的解析错误
   schemas.py     响应模型
-tests/           138 个 pytest 用例（指纹稳定性、损坏输入、附件库、
-                 cid 引用审计、HTTP 端到端）
+tests/           175 个 pytest 用例（指纹稳定性、损坏输入、附件库、
+                 cid 引用审计、展示正文选择、HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -100,6 +101,7 @@ curl -X POST http://localhost:8000/messages \
 | GET | `/messages/{id}/nodes` | 全部节点（扁平，children 为路径） |
 | GET | `/messages/{id}/nodes/{path}` | 单个节点详情（头字段、文本/二进制哈希） |
 | GET | `/messages/{id}/related-resources` | 审计 HTML 对 `cid:` 内嵌资源的引用（见下） |
+| GET | `/messages/{id}/display-body?prefer=html\|plain` | 选择客户端应展示的正文（见下） |
 | GET | `/attachments` | 附件库列表（分页 + `sha256`/`filename`/`media_type` 过滤） |
 | GET | `/attachments/{sha256}/content` | 下载附件原始解码字节（支持单段 `bytes` Range） |
 
@@ -189,6 +191,115 @@ curl http://localhost:8000/messages/1/related-resources
 
 `ambiguous` 时 `target_node_path` 为 `null`，`candidates` 列出同作用域
 所有同 ID 节点；歧义候选视为“已被引用”，不会再出现在 `orphans` 中。
+
+## 展示正文选择
+
+```bash
+curl 'http://localhost:8000/messages/1/display-body?prefer=html'
+curl 'http://localhost:8000/messages/1/display-body?prefer=plain'
+```
+
+在**已归档 MIME 树**上递归选出客户端应展示的正文。该接口是**纯只读
+查询**：只读取归档时保存的节点与头字段，不改写任何记录，因此对历史
+归档数据同样有效（无需重新归档）。
+
+递归选择规则（沿实际选中路径逐层进行）：
+
+- **`multipart/alternative`**：在可展示分支中，优先选择其*实际正文*
+  匹配 `prefer` 的分支——`prefer=html` 偏好 `text/html`、
+  `prefer=plain` 偏好 `text/plain`，多个命中取文档序第一个；没有任何
+  分支能给出偏好类型时，选择**最后一个可展示分支**（RFC 2046：备选按
+  保真度从低到高排列，末位最忠实）；
+- **`multipart/related`**：按容器 Content-Type 上的 **RFC 2387
+  `start` 参数**匹配**直接子件**的 `Content-ID`（`start` 支持
+  RFC 2231 百分号编码，尖括号做与 `cid:` 审计一致的一层容忍）；
+  **未配置 `start` 时取首个子件**（RFC 2387 的缺省根部分）；
+- **`multipart/mixed` 及其他 multipart 子类型**（如
+  `multipart/signed` / `multipart/parallel`）：按文档序取
+  **首个可展示子件**。
+
+“可展示”指递归到一个 **text 叶子**（`kind == "text"`，含
+`text/enriched` 等其他 text/*）。以下内容**不作为候选**：
+
+- 任何 `Content-Disposition: attachment` 节点（及其整棵子树；
+  `inline` 不受影响）；
+- **`message/rfc822` / `message/global` 封装报文的内部正文**——封装
+  容器是不向内穿透的屏障；
+- 非文本叶子（内嵌图片等 `blob` 节点）。
+
+空的 text 叶子仍是可展示正文（空正文也是正文）。`start` / 首个子件是
+related 的**权威**选择：目标不可展示时不静默改选其他兄弟。未被选中的
+alternative 分支即使内部含 `start` 配置错误也不阻断其他分支；当全部
+分支都不可展示时，唯一路径上的配置错误会照常返回。
+
+响应（命中时 `200`）给出最终叶子的 `node_path`、`content_type`、
+`text`，以及逐层选择轨迹 `trail`：
+
+```json
+{
+  "id": 1,
+  "fingerprint": "defeef89…299c40",
+  "prefer": "html",
+  "node_path": "2/2/1",
+  "content_type": "text/html",
+  "text": "<p>正文</p>",
+  "trail": [
+    {
+      "node_path": "",
+      "content_type": "multipart/mixed",
+      "rule": "first-displayable",
+      "considered": ["1", "2"],
+      "candidates": ["2"],
+      "chosen": "2",
+      "detail": {}
+    },
+    {
+      "node_path": "2",
+      "content_type": "multipart/alternative",
+      "rule": "alternative-prefer",
+      "considered": ["2/1", "2/2"],
+      "candidates": ["2/1", "2/2"],
+      "chosen": "2/2",
+      "detail": {"prefer": "html"}
+    },
+    {
+      "node_path": "2/2",
+      "content_type": "multipart/related",
+      "rule": "related-start",
+      "considered": ["2/2/1", "2/2/2"],
+      "candidates": ["2/2/1"],
+      "chosen": "2/2/1",
+      "detail": {"start": "body@x.com"}
+    }
+  ]
+}
+```
+
+轨迹中的 `rule` 取值：
+
+| `rule` | 含义 |
+| ---- | ---- |
+| `alternative-prefer` | alternative 中按 `prefer` 命中实际正文匹配的分支 |
+| `alternative-fallback-last` | alternative 无偏好命中，回退最后一个可展示分支 |
+| `related-start` | related 按 `start` 参数匹配 Content-ID（`detail.start`） |
+| `related-first` | related 未配置 `start`，取首个子件 |
+| `first-displayable` | mixed 等容器取首个可展示子件 |
+
+每项的 `considered` 是该层实际评估过的直接子件、`candidates` 是规则下
+合格的候选、`chosen` 是实际进入的子件。
+
+异常情况：
+
+- 邮件不存在：**404**；邮件存在但整棵树没有任何可展示正文（全是
+  attachment / 封装报文 / 二进制叶子）：**404**；
+- `prefer` 取值不是 `html` / `plain`：FastAPI 参数校验 **422**；
+- `start` 配置错误统一为带节点定位的 **422**，`node_path` 指向出问题
+  的 **multipart/related 容器**：
+
+  | 错误码 `code` | 触发条件 |
+  | ---- | ---- |
+  | `AMBIGUOUS_RELATED_START` | `start` 在直接子件中重复命中 Content-ID，`detail.candidates` 给出全部命中子件路径，`detail.start` 为规范化后的 ID |
+  | `RELATED_START_NOT_FOUND` | 配置了 `start` 但没有任何直接子件声明该 Content-ID（只匹配直接子件，不向内层后代串联），`detail.start` 为该 ID |
 
 ## 内容寻址附件库
 
@@ -286,6 +397,7 @@ curl -H 'Range: bytes=-50'   http://localhost:8000/attachments/c1e372ae…/conte
 | `INVALID_CTE` / `UNSUPPORTED_CTE` | 传输编码非法或不支持 |
 | `UNDECODABLE_CONTENT` | base64 / quoted-printable / 字符集解码失败，或 7bit 含非 ASCII 字节 |
 | `UNDECODABLE_HEADER` | RFC 2047 编码字（B/Q）本身损坏 |
+| `AMBIGUOUS_RELATED_START` / `RELATED_START_NOT_FOUND` | `display-body` 查询时 multipart/related 的 `start` 重复命中或未命中（查询期错误，不改写记录） |
 
 ## 指纹规范化规则
 

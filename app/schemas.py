@@ -151,6 +151,34 @@ class RelatedResourcesResponse(BaseModel):
     scopes: list[RelatedScope]
 
 
+# ---------------------------------------------------------------------------
+# 展示正文选择（GET /messages/{id}/display-body）
+# ---------------------------------------------------------------------------
+
+
+class DisplayBodyStep(BaseModel):
+    """容器节点上的一次逐层选择（选择轨迹中的一项）。"""
+
+    node_path: str
+    content_type: str
+    rule: str  # alternative-prefer | alternative-fallback-last
+    # related-start | related-first | first-displayable
+    considered: list[str]  # 该层实际评估过的直接子件路径（文档序）
+    candidates: list[str]  # 规则下合格的候选子件路径（文档序）
+    chosen: Optional[str]  # 实际进入的子件路径
+    detail: dict = {}  # {"prefer": "html"} 或 {"start": "<cid>"}
+
+
+class DisplayBodyResponse(BaseModel):
+    id: int
+    fingerprint: str
+    prefer: str  # html | plain
+    node_path: str
+    content_type: str
+    text: str
+    trail: list[DisplayBodyStep]
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str

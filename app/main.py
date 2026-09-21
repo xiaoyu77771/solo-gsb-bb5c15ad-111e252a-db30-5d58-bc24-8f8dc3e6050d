@@ -10,11 +10,12 @@ import json
 import os
 import sqlite3
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 
 from . import database
+from .displaybody import select_display_body
 from .errors import MIMEParseError
 from .mimeparser import fingerprint, parse_message, raw_sha256
 from .related import audit_related_resources
@@ -22,6 +23,8 @@ from .schemas import (
     AttachmentListResponse,
     AttachmentOccurrence,
     AttachmentSummary,
+    DisplayBodyResponse,
+    DisplayBodyStep,
     MessageCreated,
     MessageListResponse,
     MessageSummary,
@@ -65,8 +68,11 @@ app = FastAPI(
         "支持分页检索与带 Range 的下载。另提供 /messages/{id}/"
         "related-resources 审计 text/html 对 cid: 内嵌资源的引用，"
         "以最近 multipart/related 祖先为作用域匹配 Content-ID。"
+        "/messages/{id}/display-body 则按 multipart/alternative、"
+        "multipart/related（start 参数）与 multipart/mixed 的递归"
+        "规则选出客户端应展示的正文，并返回逐层选择轨迹。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -287,6 +293,78 @@ def get_node(
     )
     return NodeDetailResponse(
         id=message_id, fingerprint=msg["fingerprint"], node=detail
+    )
+
+
+# ---------------------------------------------------------------------------
+# 展示正文选择
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/messages/{message_id}/display-body",
+    response_model=DisplayBodyResponse,
+)
+def get_display_body(
+    message_id: int,
+    prefer: Literal["html", "plain"] = Query(
+        "html",
+        description="客户端优先展示的正文格式（multipart/alternative 中优先）",
+    ),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> DisplayBodyResponse:
+    """从已归档 MIME 树选出客户端应展示的正文（纯只读，不改写记录）。
+
+    递归规则：
+
+    * ``multipart/alternative``：在可展示分支中优先选择实际正文匹配
+      ``prefer``（``text/html`` / ``text/plain``）的分支；否则取
+      **最后一个可展示分支**（RFC 2046 末位最忠实）；
+    * ``multipart/related``：按容器 ``start`` 参数（RFC 2387）匹配
+      直接子件的 Content-ID；未配置时取**首个子件**；
+    * ``multipart/mixed`` 等其他容器：取**首个可展示子件**。
+
+    ``Content-Disposition: attachment`` 节点与
+    ``message/rfc822`` / ``message/global`` 封装报文内部正文不作为
+    候选；非文本叶子同样不可展示。无可展示正文返回 **404**；
+    ``start`` 重复命中（或未命中）返回 **422**，错误体
+    ``node_path`` 定位到对应的 multipart/related 节点。
+    """
+
+    msg = database.get_message(conn, message_id)
+    if msg is None:
+        raise _message_404(message_id)
+    rows = database.list_nodes(conn, message_id)
+
+    # start 配置错误（重复命中/未命中）抛 MIMEParseError，由全局
+    # 异常处理器转成带 node_path 的 422。
+    selection = select_display_body(rows, prefer)
+    if selection.leaf is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"邮件 {message_id} 没有可展示的正文（attachment /"
+            " 封装报文 / 非文本叶子均不作为候选）",
+        )
+    leaf = selection.leaf
+    return DisplayBodyResponse(
+        id=message_id,
+        fingerprint=msg["fingerprint"],
+        prefer=prefer,
+        node_path=leaf["path"],
+        content_type=leaf["content_type"],
+        text=leaf["text_content"] if leaf["text_content"] is not None else "",
+        trail=[
+            DisplayBodyStep(
+                node_path=step.node_path,
+                content_type=step.content_type,
+                rule=step.rule,
+                considered=step.considered,
+                candidates=step.candidates,
+                chosen=step.chosen,
+                detail=step.detail,
+            )
+            for step in selection.steps
+        ],
     )
 
 
