@@ -27,11 +27,12 @@ app/
   main.py        FastAPI 路由与启动初始化
   mimeparser.py  严格 MIME/RFC 5322 解析、传输解码、规范化与指纹
   related.py     cid: 内嵌资源引用审计（RFC 2392，multipart/related 作用域）
+  displaybody.py 展示正文选择（alternative/related/mixed 递归规则与轨迹）
   database.py    SQLite 建表、事务化写入、消息/节点/附件查询
   errors.py      定位到节点的解析错误
   schemas.py     响应模型
-tests/           138 个 pytest 用例（指纹稳定性、损坏输入、附件库、
-                 cid 引用审计、HTTP 端到端）
+tests/           162 个 pytest 用例（指纹稳定性、损坏输入、附件库、
+                 cid 引用审计、展示正文选择、HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -99,6 +100,7 @@ curl -X POST http://localhost:8000/messages \
 | GET | `/messages/{id}/tree` | **嵌套 MIME 树** |
 | GET | `/messages/{id}/nodes` | 全部节点（扁平，children 为路径） |
 | GET | `/messages/{id}/nodes/{path}` | 单个节点详情（头字段、文本/二进制哈希） |
+| GET | `/messages/{id}/display-body` | 选出客户端应展示的正文（`prefer=html|plain`，见下） |
 | GET | `/messages/{id}/related-resources` | 审计 HTML 对 `cid:` 内嵌资源的引用（见下） |
 | GET | `/attachments` | 附件库列表（分页 + `sha256`/`filename`/`media_type` 过滤） |
 | GET | `/attachments/{sha256}/content` | 下载附件原始解码字节（支持单段 `bytes` Range） |
@@ -115,6 +117,38 @@ curl http://localhost:8000/messages/1/nodes/2/1     # 第 2 部分里的封装�
 
 文本叶子的 `text` 是按声明字符集解码、NFC 规范化、换行统一为 `\n`
 后的内容；非文本叶子不回传字节，只给 `blob_sha256` 与 `blob_length`。
+
+## 展示正文选择（display-body）
+
+```bash
+curl http://localhost:8000/messages/1/display-body
+curl http://localhost:8000/messages/1/display-body?prefer=plain
+```
+
+从已归档的 MIME 树中选出客户端应展示的正文，返回 `node_path`、
+`content_type`、`text` 与逐层选择轨迹 `trace`。规则（递归）：
+
+- `multipart/alternative`：在可展示分支中优先 `prefer`
+  （html→text/html、plain→text/plain，按文档序取第一个匹配），
+  都不匹配时取**最后一个可展示分支**（RFC 2046“越靠后越接近原文”）；
+- `multipart/related`（RFC 2387）：`start` 参数按 Content-ID 匹配
+  唯一直接子件；未配置（或配置但未命中）时取**首个子件**；
+  `start` 命中多个子件属于归档数据歧义，返回 **422**
+  （`AMBIGUOUS_RELATED_START`，`node_path` 定位到该 related 节点，
+  `detail.candidates` 列出全部命中子件）；
+- `multipart/mixed` 及其他未特化的 multipart 子类型（signed、
+  report、digest 等）：取**首个可展示子件**（RFC 2046：未知子类型
+  按 mixed 处理）；
+- **attachment disposition 与 message/rfc822 内部正文不作候选**。
+
+“可展示”指递归选择最终能得到一个 text/* 叶子（非附件、不在
+message/rfc822 内部）。轨迹 `trace` 每个经过的容器一条：
+`rule`（`mixed.first_displayable` / `alternative.prefer` /
+`alternative.last_displayable` / `related.start` / `related.first` /
+`leaf`）、`chosen`（选中的子件）、`candidates`（参与抉择的子件，
+mixed/alternative 为可展示子件，related 为全部直接子件）、
+`detail`（如 alternative 的 `prefer`、related 的 `start`）。
+邮件不存在返回 404，没有可展示正文同样返回 404。
 
 ## `cid:` 内嵌资源引用审计
 
@@ -287,6 +321,12 @@ curl -H 'Range: bytes=-50'   http://localhost:8000/attachments/c1e372ae…/conte
 | `UNDECODABLE_CONTENT` | base64 / quoted-printable / 字符集解码失败，或 7bit 含非 ASCII 字节 |
 | `UNDECODABLE_HEADER` | RFC 2047 编码字（B/Q）本身损坏 |
 
+查询阶段（非解析阶段）还有一个 422 错误码：
+
+| `code` | 触发条件 |
+| ---- | ---- |
+| `AMBIGUOUS_RELATED_START` | `multipart/related` 的 `start` 参数同时命中多个子件（见“展示正文选择”） |
+
 ## 指纹规范化规则
 
 指纹输入是一棵 JSON 规范树（键排序、无多余空白、UTF-8、LF），
@@ -336,3 +376,6 @@ print(canon.decode())
   不参与指纹。
 - `message/rfc822` 与 `message/global` 容器递归解析；容器自身的 CTE
   先还原再递归。
+- **展示正文选择只读不改写**：`/messages/{id}/display-body` 完全基于
+  现有 `nodes` 表（content_type / disposition / headers / children），
+  不新增列、不回溯改写任何已归档记录；旧库文件无需迁移即可查询。

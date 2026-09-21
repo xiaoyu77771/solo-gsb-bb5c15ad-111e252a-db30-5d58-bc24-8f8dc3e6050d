@@ -39,3 +39,36 @@ class MIMEParseError(Exception):
                 "detail": self.detail,
             }
         }
+
+
+class DisplayBodyError(Exception):
+    """展示正文选择（display-body）过程中遇到的语义错误。
+
+    与 :class:`MIMEParseError` 相同的响应结构（HTTP 422，
+    ``node_path`` 定位到出问题的容器节点），但发生在查询阶段而非
+    解析阶段——例如 multipart/related 的 ``start`` 参数同时命中
+    多个子件。
+    """
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        node_path: str = "",
+        detail: dict | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.node_path = node_path
+        self.detail = detail or {}
+
+    def to_dict(self) -> dict:
+        return {
+            "error": {
+                "code": self.code,
+                "message": self.message,
+                "node_path": self.node_path,
+                "detail": self.detail,
+            }
+        }

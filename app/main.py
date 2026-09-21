@@ -15,13 +15,16 @@ from typing import Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 
 from . import database
-from .errors import MIMEParseError
+from .displaybody import select_display_body
+from .errors import DisplayBodyError, MIMEParseError
 from .mimeparser import fingerprint, parse_message, raw_sha256
 from .related import audit_related_resources
 from .schemas import (
     AttachmentListResponse,
     AttachmentOccurrence,
     AttachmentSummary,
+    DisplayBodyResponse,
+    DisplayBodyTraceEntry,
     MessageCreated,
     MessageListResponse,
     MessageSummary,
@@ -64,9 +67,11 @@ app = FastAPI(
         "非文本叶子的解码字节按 SHA-256 去重进入内容寻址附件库，"
         "支持分页检索与带 Range 的下载。另提供 /messages/{id}/"
         "related-resources 审计 text/html 对 cid: 内嵌资源的引用，"
-        "以最近 multipart/related 祖先为作用域匹配 Content-ID。"
+        "以最近 multipart/related 祖先为作用域匹配 Content-ID；"
+        "/messages/{id}/display-body 按 alternative/related/mixed "
+        "规则递归选出客户端应展示的正文。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -81,6 +86,13 @@ def get_conn(request: Request) -> sqlite3.Connection:
 
 @app.exception_handler(MIMEParseError)
 async def mime_parse_error_handler(request: Request, exc: MIMEParseError):
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=422, content=exc.to_dict())
+
+
+@app.exception_handler(DisplayBodyError)
+async def display_body_error_handler(request: Request, exc: DisplayBodyError):
     from fastapi.responses import JSONResponse
 
     return JSONResponse(status_code=422, content=exc.to_dict())
@@ -287,6 +299,62 @@ def get_node(
     )
     return NodeDetailResponse(
         id=message_id, fingerprint=msg["fingerprint"], node=detail
+    )
+
+
+# ---------------------------------------------------------------------------
+# 展示正文选择
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/messages/{message_id}/display-body",
+    response_model=DisplayBodyResponse,
+)
+def get_display_body(
+    message_id: int,
+    prefer: str = Query(
+        "html",
+        pattern="^(html|plain)$",
+        description="multipart/alternative 中优先展示的媒体类型"
+        "（html→text/html，plain→text/plain）",
+    ),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> DisplayBodyResponse:
+    """从已归档 MIME 树选出客户端应展示的正文（纯查询，不改写记录）。
+
+    递归规则：
+
+    * ``multipart/alternative``：可展示分支中优先 ``prefer`` 对应类型，
+      无匹配取最后一个可展示分支；
+    * ``multipart/related``：``start`` 参数按 Content-ID 唯一定位子件，
+      未配置或未命中取首个子件；start 重复命中返回 422 并定位该
+      related 节点；
+    * ``multipart/mixed`` 及其他 multipart 子类型：取首个可展示子件；
+    * attachment disposition 与 message/rfc822 内部正文不作候选。
+
+    响应含 ``node_path`` / ``content_type`` / ``text`` 与逐层选择
+    轨迹 ``trace``；无可展示正文返回 404。
+    """
+
+    msg = database.get_message(conn, message_id)
+    if msg is None:
+        raise _message_404(message_id)
+    rows = database.list_nodes(conn, message_id)
+    result = select_display_body(rows, prefer)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"邮件 {message_id} 没有可展示的正文",
+        )
+    candidate, trace = result
+    return DisplayBodyResponse(
+        id=message_id,
+        fingerprint=msg["fingerprint"],
+        node_path=candidate.node_path,
+        content_type=candidate.content_type,
+        text=candidate.text,
+        trace=[DisplayBodyTraceEntry(**vars(e)) for e in trace],
     )
 
 

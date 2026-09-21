@@ -151,6 +151,33 @@ class RelatedResourcesResponse(BaseModel):
     scopes: list[RelatedScope]
 
 
+# ---------------------------------------------------------------------------
+# 展示正文选择（GET /messages/{id}/display-body）
+# ---------------------------------------------------------------------------
+
+
+class DisplayBodyTraceEntry(BaseModel):
+    """一层选择轨迹：在哪个节点、按什么规则、选了哪个子件。"""
+
+    node_path: str
+    content_type: str
+    # mixed.first_displayable / alternative.prefer /
+    # alternative.last_displayable / related.start / related.first / leaf
+    rule: str
+    chosen: Optional[str] = None  # 选中的子件路径；叶子为 None
+    candidates: list[str] = []  # 参与抉择的子件（语义随规则，见 README）
+    detail: dict = {}  # 规则附加上下文（prefer、start 等）
+
+
+class DisplayBodyResponse(BaseModel):
+    id: int
+    fingerprint: str
+    node_path: str
+    content_type: str
+    text: str
+    trace: list[DisplayBodyTraceEntry]
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str

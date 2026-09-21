@@ -632,6 +632,24 @@ def parse_content_type(value: bytes, path: str) -> ContentType:
     )
 
 
+def parse_structured_params(
+    value: str, path: str, header_name: str
+) -> dict[str, str]:
+    """解析已解码结构头字符串值（如库中存储的 Content-Type 值）的参数。
+
+    查询路径（如展示正文选择需要读取 multipart/related 的 ``start``
+    参数）与入库时共用同一套严格解析器，保证“写入时怎么解析、查询时
+    还是怎么解析”。输入是 ``str``（入库前已完成 RFC 2047 解码与 NFC），
+    内部按 UTF-8 还原为字节再走正常参数解析；数据在入库时已通过同一
+    校验，正常不会抛 :class:`MIMEParseError`，调用方可按需容错降级。
+    """
+
+    _lead, items = _parse_parameters(
+        value.encode("utf-8"), path, header_name
+    )
+    return _assemble_parameters(items, path, header_name)
+
+
 def parse_disposition(value: bytes, path: str) -> tuple[str, dict[str, str]]:
     lead, raw_items = _parse_parameters(value, path, "Content-Disposition")
     if any(ch not in _TOKEN_STR for ch in lead):
